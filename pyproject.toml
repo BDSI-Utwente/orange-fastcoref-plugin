@@ -1,0 +1,25 @@
+[project]
+name = "orange-fastcoref-plugin"
+version = "0.1.0"
+description = "FastCoRef corference resolution plugin for Orange3"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastcoref>=2.1.6",
+    "orange3>=3.39.0",
+    "orange3-network>=1.10.1",
+    "orange3-text>=1.16.3",
+    "pyqt6",
+    "pyqt6-tools>=6.4.2.3.3",
+    "spacy>=3.8.7",
+]
+
+[project.entry-points."orange3.addon"]
+"FastCoRef" = "fastcoref"
+
+[project.entry-points."orange.widgets"]
+"Coreference Resolution" = "fastcoref.widgets"
+
+[tool.setuptools]
+package-dir = {"fastcoref" = "orangecontrib/fastcoref" }
+include-package-data = true
