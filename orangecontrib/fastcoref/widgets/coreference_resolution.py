@@ -1,3 +1,4 @@
+from functools import partial
 from Orange.data import Table
 from Orange.widgets import gui
 from concurrent.futures import Future, wait
@@ -37,6 +38,7 @@ class Task:
     future: Future = None
     watcher: FutureWatcher = None
     cancelled = False
+    callback: callable = None
 
     def cancel(self):
         self.cancelled = True
@@ -58,6 +60,15 @@ class CoreferenceResolutionWidget(OWWidget):
     want_main_area = False
     resizing_enabled = True
 
+    # data
+    corpus: Corpus | None = None  # input corpus
+    nlp: spacy.language.Language | None = None  # spaCy NLP object
+
+    # threaded tasks
+    _task: Task | None = None  # currently running task
+    _executor: ThreadExecutor  # executor for running tasks in a separate thread
+
+    # settings
     commitOnChange = Setting(True)  # commit on change of inputs
     coref_model = Setting(
         DEFAULT_FASTCOREF_MODEL
@@ -85,9 +96,7 @@ class CoreferenceResolutionWidget(OWWidget):
         super().__init__()
 
         # currently running task
-        self._spacy_download_task = None
-        self._spacy_load_task = None
-        self._coref_load_task = None
+        self._task = None
         self._executor = ThreadExecutor()
 
         self.corpus = None
@@ -151,22 +160,33 @@ class CoreferenceResolutionWidget(OWWidget):
             self.commit()
 
     def spacy_model_changed(self):
-        if spacy.util.is_package(self.spacy_model):
-            self._start_spacy_load_task(self.spacy_model)
-        else:
-            self._start_spacy_download_task(self.spacy_model)
+        self._start_spacy_load_task(self.spacy_model)
+
+    def _cancel_or_await_current_task(self):
+        """Cancel the current task if it is running, or wait for it to finish."""
+        if self._task is not None:
+            self._task.cancel()
+            assert self._task.future.done()
+            self._task.watcher.done.disconnect()
+            self._task = None
+
+    def _assert_task_finished(self, future):
+        """Assert that the current task has finished."""
+        assert self.thread() is QThread.currentThread()
+        assert self._task is not None
+        assert self._task.future is future
+        assert future.done()
 
     def _start_spacy_load_task(self, model_name):
-        if self._spacy_load_task is not None:
-            self._spacy_load_task.cancel()
-            assert self._spacy_load_task.future.done()
-            self._spacy_load_task.watcher.done.disconnect(
-                self._spacy_load_task_finished
-            )
-            self._spacy_load_task = None
+        """Start a task to load the spaCy model."""
+        self._cancel_or_await_current_task()
+
+        if not spacy.util.is_package(self.spacy_model):
+            self._start_spacy_download_task(self.spacy_model)
+            return
 
         self.Information.spacy_load_model(model_name)
-        self._spacy_load_task = task = Task()
+        self._task = task = Task()
         task.future = self._executor.submit(spacy.load, model_name)
         task.watcher = FutureWatcher(task.future)
         task.watcher.done.connect(self._spacy_load_task_finished)
@@ -174,13 +194,10 @@ class CoreferenceResolutionWidget(OWWidget):
     @pyqtSlot(Future)
     def _spacy_load_task_finished(self, future):
         # assert that we're looking at the correct task, and that it has finished
-        assert self.thread() is QThread.currentThread()
-        assert self._spacy_load_task is not None
-        assert self._spacy_load_task.future is future
-        assert future.done()
+        self._assert_task_finished(future)
 
         # clear task, info message
-        self._spacy_load_task = None
+        self._task = None
         self.Information.spacy_load_model.clear()
 
         # load the spaCy model
@@ -190,122 +207,155 @@ class CoreferenceResolutionWidget(OWWidget):
         self._start_coref_load_task(self.coref_model)
 
     def _start_spacy_download_task(self, model_name):
-        if self._spacy_download_task is not None:
-            self._spacy_download_task.cancel()
-            assert self._spacy_download_task.future.done()
-            self._spacy_download_task.watcher.done.disconnect(
-                self._spacy_download_task_finished
-            )
-            self._spacy_download_task = None
+        self._cancel_or_await_current_task()
 
         self.Information.spacy_download_model(model_name)
-        self._spacy_download_task = task = Task()
+        self._task = task = Task()
         task.future = self._executor.submit(spacy.cli.download, model_name)
         task.watcher = FutureWatcher(task.future)
         task.watcher.done.connect(self._spacy_download_task_finished)
 
     @pyqtSlot(Future)
     def _spacy_download_task_finished(self, future):
-        # assert that we're looking at the correct task, and that it has finished
-        assert self.thread() is QThread.currentThread()
-        assert self._spacy_download_task is not None
-        assert self._spacy_download_task.future is future
-        assert future.done()
+        self._assert_task_finished(future)
 
         # clear task, info message
-        self._spacy_download_task = None
+        self._task = None
         self.Information.spacy_download_model.clear()
 
         # start loading the spaCy model
         self._start_spacy_load_task(self.spacy_model)
 
     def coref_model_changed(self):
-        if self.nlp is not None:
-            self._start_coref_load_task(self.coref_model)
+        self._start_coref_load_task(self.coref_model)
 
     def _start_coref_load_task(self, model_name):
-        if self._coref_load_task is not None:
-            self._coref_load_task.cancel()
-            assert self._coref_load_task.future.done()
-            self._coref_load_task.watcher.done.disconnect(
-                self._coref_load_task_finished
-            )
-            self._coref_load_task = None
+        self._cancel_or_await_current_task()
 
+        # if we don't have a spacy model loaded, do that first
+        # note that the task finished handler for the spacy model
+        # will start the coreference model loading task again
+        if self.nlp is None:
+            self._start_spacy_load_task(self.spacy_model)
+            return
+
+        # start coreference model loading
         self.information(f"{model_name} loading...")
 
-        self._coref_load_task = task = Task()
+        # define a worker function to load the coreference model
+        def _coref_load_worker(nlp: spacy.language.Language, model_name: str):
+            """Load the coreference model."""
+            # if we already have a coreference model loaded, unload it first
+            if "fastcoref" in nlp.pipe_names:
+                nlp.remove_pipe("fastcoref")
 
-        if model_name == "fastcoref":
-            task.future = self._executor.submit(self.nlp.add_pipe, "fastcoref")
-        elif model_name == "lingmess":
-            task.future = self._executor.submit(
-                self.nlp.add_pipe,
-                "fastcoref",
-                config={
-                    "model_architecture": "LingMessCoref",
-                    "model_path": "biu-nlp/lingmess-coref",
-                },
-            )
+            # load new coreference model pipeline component
+            if model_name == "fastcoref":
+                nlp.add_pipe("fastcoref")
+            elif model_name == "lingmess":
+                nlp.add_pipe(
+                    "fastcoref",
+                    config={
+                        "model_architecture": "LingMessCoref",
+                        "model_path": "biu-nlp/lingmess-coref",
+                    },
+                )
+            else:
+                raise ValueError(f"Unknown coreference model: {model_name}")
+
+        self._task = task = Task()
+        task.future = self._executor.submit(
+            partial(_coref_load_worker, self.nlp, model_name)
+        )
         task.watcher = FutureWatcher(task.future)
         task.watcher.done.connect(self._coref_load_task_finished)
 
     @pyqtSlot(Future)
     def _coref_load_task_finished(self, future):
-        # assert that we're looking at the correct task, and that it has finished
-        assert self.thread() is QThread.currentThread()
-        assert self._coref_load_task is not None
-        assert self._coref_load_task.future is future
-        assert future.done()
+        self._assert_task_finished(future)
 
         # clear task, info message
-        self._coref_load_task = None
+        self._task = None
         self.Information.clear()
 
     def _start_coref_resolution(self):
-        if self.corpus is None or self.nlp is None:
+        if self.corpus is None:
             return
 
-        # Process the corpus with the spaCy pipeline
-        docs = [
-            self.nlp(
-                doc["Text"].value, component_cfg={"fastcoref": {"resolve_text": True}}
+        # if nlp or coref model isn't loaded yet, do that first
+        # TODO: we currently start just the nlp/coref load task, then return
+        #   should we implement some way of queueing the resolution task?
+        self._cancel_or_await_current_task()
+        if self.nlp is None:
+            self._start_spacy_load_task(self.spacy_model)
+            return
+
+        if not self.nlp.has_pipe("fastcoref"):
+            self._start_coref_load_task(self.coref_model)
+            return
+
+        def _coref_resolution_worker(corpus: Corpus, nlp: spacy.language.Language):
+            """Process the corpus with the spaCy pipeline and resolve coreferences."""
+
+            resolved_corpus = corpus.copy()
+            coreferences = []
+
+            for doc_idx, doc in enumerate(corpus):
+                # Process each document in the corpus with the spaCy pipeline
+                resolved_doc = nlp(
+                    doc["Text"].value,
+                    component_cfg={"fastcoref": {"resolve_text": True}},
+                )
+                resolved_corpus[doc_idx]["Text"] = resolved_doc._.resolved_text
+
+                # Extract coreference clusters
+                for cluster_idx, cluster in enumerate(resolved_doc._.coref_clusters):
+                    for start, end in cluster:
+                        coreferences.append(
+                            {
+                                "doc": doc_idx,
+                                "cluster": cluster_idx,
+                                "start": start,
+                                "end": end,
+                                "text": resolved_doc.text[start:end],
+                            }
+                        )
+
+            # re-tokenize the resolved corpus
+            resolved_corpus.name = f"{corpus.name} (resolved coreferences)"
+            resolved_corpus = BASE_TOKENIZER(resolved_corpus)
+
+            # Build a Table for coreferences, going through a pandas DataFrame for convenience
+            _coreferences_df = pd.DataFrame.from_dict(coreferences)
+            coreferences = Table.from_pandas_dfs(
+                xdf=_coreferences_df[["doc", "cluster", "start", "end"]],
+                ydf=_coreferences_df[[]],
+                mdf=_coreferences_df[["text"]],
             )
-            for doc in self.corpus
-        ]
-        newdocs = []
 
-        # Extract mentions and coreferences
-        coreferences = []
-        for doc_idx, doc in enumerate(docs):
-            newdocs.append(doc._.resolved_text)
-            for cluster_idx, cluster in enumerate(doc._.coref_clusters):
-                for start, end in cluster:
-                    coref = {
-                        "doc": doc_idx,
-                        "cluster": cluster_idx,
-                        "start": start,
-                        "end": end,
-                        "text": doc.text[start:end],
-                    }
-                    coreferences.append(coref)
+            return resolved_corpus, coreferences
 
-        # Create a copy of the original corpus with resolved texts, and rerun tokenization
-        _resolved_corpus = self.corpus.copy()
-        for i, doc in enumerate(newdocs):
-            _resolved_corpus[i]["Text"] = doc
-        _resolved_corpus.name = f"{self.corpus.name} (resolved)"
-        _resolved_corpus = BASE_TOKENIZER(_resolved_corpus)
-        self.Outputs.resolved_corpus.send(_resolved_corpus)
-
-        # Build a Table for coreferences, going through a pandas DataFrame for convenience
-        coreferences_df = pd.DataFrame.from_dict(coreferences)
-        coreferences_table = Table.from_pandas_dfs(
-            xdf=coreferences_df[["doc", "cluster", "start", "end"]],
-            ydf=coreferences_df[[]],
-            mdf=coreferences_df[["text"]],
+        # Start the coreference resolution task
+        # TODO: hook up progress bar
+        self.information("Resolving coreferences...")
+        self._task = task = Task()
+        task.future = self._executor.submit(
+            partial(_coref_resolution_worker, self.corpus, self.nlp)
         )
-        self.Outputs.coreferences.send(coreferences_table)
+        task.watcher = FutureWatcher(task.future)
+        task.watcher.done.connect(self._coref_resolution_finished)
+
+    @pyqtSlot(Future)
+    def _coref_resolution_finished(self, future: Future):
+        """Handle the completion of the coreference resolution task."""
+        self._assert_task_finished(future)
+        self._task = None  # clear the task
+
+        resolved_corpus, coreferences = future.result()
+
+        self.Information.clear()
+        self.Outputs.resolved_corpus.send(resolved_corpus)
+        self.Outputs.coreferences.send(coreferences)
 
     def commit(self):
         self.Outputs.resolved_corpus.send(self.corpus)
