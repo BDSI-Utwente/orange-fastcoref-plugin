@@ -10,6 +10,8 @@ A FastCoRef coreference resolution plugin for [Orange3](https://orange.biolab.si
 
 ## Installation
 
+Due to various conflicting dependencies and requirements, this plugin requires Python 3.11 specifically (python>=3.11, <3.12).
+
 Install via pip:
 
 ```sh
@@ -24,7 +26,19 @@ pip install git+https://github.com/bdsi-utwente/orange-fastcoref-plugin.git
 
 ## Usage
 
-After installation, launch Orange3. The "Coreference Resolution" widget will be available for use in your workflows.
+After installation, launch Orange3. 
+
+```
+orange-canvas
+```
+
+or 
+
+```
+python -m Oranve.canvas
+```
+
+The "Coreference Resolution" widget will be available for use in your workflows.
 
 ## License
 
