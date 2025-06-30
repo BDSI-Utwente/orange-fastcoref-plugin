@@ -13,10 +13,7 @@ dependencies = [
     "pyqt6-tools>=6.4.2.3.3",
     "spacy>=3.8.7",
 ]
-authors = [
-	{name = "Karel Kroeze",
-    email = "k.a.kroeze@utwente.nl" },
-]
+authors = [{name = "Karel Kroeze", email = "k.a.kroeze@utwente.nl"}]
 keywords = [
     "orange3 add-on",
     "coreference resolution",
@@ -26,13 +23,12 @@ keywords = [
     "natural language processing",
     "text mining",
 ]
-license = {text = "GPL 3.0 or later"}
+license = "GPL-3.0-or-later"
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Environment :: Plugins",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Natural Language :: English",
     "Natural Language :: Dutch",
     "Programming Language :: Python :: 3.11"
@@ -51,6 +47,10 @@ based_on = "https://github.com/shon-otmazgin/fastcoref"
 
 [project.entry-points."orange.widgets"]
 "Coreference Resolution" = "fastcoref.widgets"
+
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = {"fastcoref" = "orangecontrib/fastcoref" }
